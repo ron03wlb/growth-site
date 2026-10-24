@@ -1,0 +1,101 @@
+<!DOCTYPE html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Global API Rate Limiter 設計 · Ron's Growth</title><link rel="stylesheet" href="/growth-site/_astro/Base.BKz5aqPE.css"></head><body><header class="site-header"><a class="brand" href="/growth-site/">Ron's Growth</a><nav><a href="/growth-site/03-architecture/">架構層</a><a href="/growth-site/canvas/">白板</a></nav></header><main class="narrow"><p class="crumbs"><a href="/growth-site/03-architecture/">架構層</a></p><h1>Global API Rate Limiter 設計</h1><p class="map-link"><a href="/growth-site/03-architecture/canvas/global-api-rate-limiter/">◇ 在白板上檢視「Global API Rate Limiter」</a></p><article class="prose"><h2 id="設計入口與需求邊界">設計入口與需求邊界</h2>
+<p><strong>先分清三件事</strong>：需求問題用來確認必要的限制與行為；設計假設是在資訊不足時明示暫定前提；設計選擇才是依需求決定 key、演算法、儲存與跨區協調。不要直接假設以 IP 限流，也不要先挑演算法。</p>
+<p>需求問答有三個並列面向，不是執行步驟：<a href="/growth-site/03-architecture/global-api-rate-limiter/#%E9%99%90%E6%B5%81%E5%A5%91%E7%B4%84%E9%99%90%E5%88%B6%E8%AA%B0%E8%B6%85%E9%99%90%E6%80%8E%E9%BA%BC%E8%BE%A6">限流契約：限制誰，超限怎麼辦？</a>、<a href="/growth-site/03-architecture/global-api-rate-limiter/#%E6%B5%81%E9%87%8F%E8%AA%9E%E6%84%8F%E5%85%81%E8%A8%B1-burst%E9%82%84%E6%98%AF%E5%9A%B4%E6%A0%BC%E6%99%82%E9%96%93%E7%AA%97">流量語意：允許 burst，還是嚴格時間窗？</a>、<a href="/growth-site/03-architecture/global-api-rate-limiter/#%E5%85%A8%E5%9F%9F%E8%AA%9E%E6%84%8F%E8%B7%A8%E5%8D%80%E5%85%B1%E4%BA%AB%E5%A4%9A%E5%B0%91%E9%A1%8D%E5%BA%A6%E8%A6%8F%E5%89%87%E5%A4%9A%E4%B9%85%E7%94%9F%E6%95%88">全域語意：跨區共享多少額度，規則多久生效？</a>。</p>
+<p><strong>責任邊界</strong>：DNS、Global Load Balancer 或 routing layer 決定 client 前往哪個 region；Rate Limiter 依規則判定請求是否可進入，保護可用性、公平性與下游容量。</p>
+<p><strong>推薦路徑</strong>：釐清需求 → 選定演算法 → 單區 Redis 實作 → 多維度與熱點 → 全域配額 → 失敗政策與觀測。容量估算是需求驅動的分支。</p>
+<h2 id="限流契約限制誰超限怎麼辦">限流契約：限制誰，超限怎麼辦？</h2>
+<p><strong>要確認的事</strong>：限流的對象，以及用完額度後對 client 的承諾。</p>
+<h3 id="主要限流身分是什麼">主要限流身分是什麼？</h3>
+<blockquote>
+<p>What is the primary rate-limit identity?</p>
+<p>Should we limit by API key, tenant, user, IP address, endpoint, or a combination?</p>
+</blockquote>
+<p><strong>影響的決策</strong>：counter key、租戶公平性與資料分區方式。外部 API 平台通常優先考慮 API key 或 tenant；多個使用者可能共用 NAT IP，只以 IP 限流可能誤傷合法流量。</p>
+<h3 id="超限後怎麼處理">超限後怎麼處理？</h3>
+<blockquote>
+<p>What should happen when a client exceeds the limit?</p>
+<p>Should we reject immediately with HTTP 429 and a Retry-After header, queue requests, or degrade service?</p>
+</blockquote>
+<p><strong>影響的決策</strong>：client retry behavior、下游負載、API contract 與可觀測性。</p>
+<h2 id="流量語意允許-burst還是嚴格時間窗">流量語意：允許 burst，還是嚴格時間窗？</h2>
+<p><strong>要確認的事</strong>：短暫尖峰是否可接受，以及限制要精確到什麼程度。這兩項需求是演算法選擇的依據，不是先選演算法再補理由。</p>
+<blockquote>
+<p>Should clients be allowed to send short bursts, as long as their average request rate stays within the plan limit?</p>
+</blockquote>
+<p><strong>影響的決策</strong>：是否需要允許短暫 burst，以及是否適合採用 Token Bucket。</p>
+<blockquote>
+<p>Do we need an exact limit over a rolling time window, or is approximate enforcement acceptable?</p>
+</blockquote>
+<p><strong>影響的決策</strong>：限流精確度、儲存與計算成本，以及請求延遲。例如「任何連續 60 秒不得超過 1,000 次」比「每分鐘大致不超過 1,000 次」更嚴格。</p>
+<h2 id="全域語意跨區共享多少額度規則多久生效">全域語意：跨區共享多少額度，規則多久生效？</h2>
+<p><strong>要確認的事</strong>：限額的跨區範圍，以及設定更新容許多長的傳播時間。</p>
+<blockquote>
+<p>Do we need global limits across all regions, per-region limits, or both?</p>
+</blockquote>
+<p><strong>影響的決策</strong>：region 是否必須共享計數器、跨 region 延遲，以及可接受的一致性誤差。要明確詢問是否容許短暫超限或跨區協調延遲。</p>
+<blockquote>
+<p>How quickly must rule changes take effect?</p>
+</blockquote>
+<p><strong>影響的決策</strong>：config propagation、cache 策略，以及是否容許短時間使用舊規則。跨區額度判定不等於導流，見 <a href="/growth-site/03-architecture/global-api-rate-limiter/#%E8%A8%AD%E8%A8%88%E5%85%A5%E5%8F%A3%E8%88%87%E9%9C%80%E6%B1%82%E9%82%8A%E7%95%8C">設計入口與需求邊界</a>。</p>
+<h2 id="容量估算與-hot-path-狀態">容量估算與 Hot Path 狀態</h2>
+<p><strong>先分清 hot path 狀態與 request log</strong>：每次判定只需要 bucket state（剩餘 token、lastRefill）。IP、device、browser 等 request metadata 屬於稽核或分析 log，非同步寫入 ELK、ClickHouse 或 object storage，不進入判定路徑。</p>
+<p><strong>狀態量以 active key 估算</strong>：每個 key 的欄位約 32 bytes，100 萬個 key 的原始資料約 32MB；加上 Redis 每個 key 約 50–100 bytes 的額外開銷後約 100MB 級，單一 Redis node 就能容納。TTL 約為 capacity ÷ refillRate，讓閒置 key 自動回收。</p>
+<p><strong>吞吐與延遲預算決定 Redis 規模</strong>：Redis ops/s ≈ 峰值 QPS × 每個 request 檢查的維度數，例如 10k QPS × 4 個維度 = 40k ops/s。limiter 加在每個 request 上，判定預算通常只有個位數 ms，所以 Redis 呼叫要設短 timeout，並且就近部署。</p>
+<h2 id="rate-limiting-演算法選型">Rate Limiting 演算法選型</h2>
+<ul>
+<li><strong>允許有限 burst → Token Bucket</strong>：適合 API gateway 的 admission control；代價是要決定 refill rate、bucket size，並處理分散式 counter 的一致性與原子性。</li>
+<li><strong>平滑下游吞吐 → Leaky Bucket</strong>：適合 payment、email、非同步 worker 或第三方 API；代價是排隊延遲。</li>
+<li><strong>嚴格連續時間窗 → Sliding Window</strong>：適合 anti-abuse 或合約明定的 rolling limit；精準版本需要更多 state 與計算。</li>
+</ul>
+<p><strong>可以組合，不必三選一</strong>：同步 API 用 Token Bucket 保護准入，非同步工作再用 queue-based shaper 平滑。</p>
+<h2 id="token-bucket允許有限的短暫-burst">Token Bucket：允許有限的短暫 burst</h2>
+<p><strong>核心想法</strong>：bucket 內有 token，token 依固定速率 r 補充；每個 request 消耗一個 token，有 token 就通過，沒有就拒絕或等待。容量 B 限制最多可累積多少未使用額度：r 控制長期平均速率，B 控制最大 burst。</p>
+<ul>
+<li>例：capacity = 10，refill rate = 10 requests/minute。滿 bucket 的 client 可以在瞬間送出 10 個 request，之後必須等待 token 逐步補回。</li>
+<li>不排隊、不增加延遲，適合延遲優先的 API。</li>
+</ul>
+<p><strong>實際應用</strong>：public API gateway、依 API key／tenant／user／endpoint 執行不同方案的 quota、login 與 password reset 的 abuse protection。</p>
+<blockquote>
+<p>Use Token Bucket when we need to enforce a long-term average rate while allowing bounded short bursts.</p>
+</blockquote>
+<h2 id="leaky-bucket以固定節奏保護下游">Leaky Bucket：以固定節奏保護下游</h2>
+<p><strong>核心想法</strong>：請求先進入有限 FIFO queue，再以近似固定速率流向下游；queue 滿時，新請求必須被拒絕、丟棄或採取其他明確策略。它本質上是 traffic shaping，控制工作送往下游的節奏。</p>
+<ul>
+<li>例：client 在同一秒送來 10 個工作，但 worker 每 6 秒只取出 1 個；下游看到的是穩定流量。</li>
+</ul>
+<p><strong>實際應用</strong>：吞吐固定或昂貴的下游（payment processor、email provider、第三方 API）、非同步 job pipeline、寫入資料庫或批次任務前的節流。</p>
+<p><strong>限制</strong>：同步 API 不宜長時間排隊，否則 client 可能 timeout，服務也會累積連線與記憶體壓力。常見做法是 gateway 先用 Token Bucket admission control，再對非同步工作使用 queue-based shaping。</p>
+<blockquote>
+<p>Use a Leaky Bucket or queue-based shaper when the downstream system needs a predictable, smoothed request rate.</p>
+</blockquote>
+<h2 id="sliding-window嚴格遵守最近一段連續時間的上限">Sliding Window：嚴格遵守最近一段連續時間的上限</h2>
+<p><strong>核心想法</strong>：計算最近一個連續時間區間內已發生的 request。規則是「任何連續 60 秒最多 10 次」時，每次請求都要考慮前 60 秒，而不是只看目前落在哪一個固定分鐘。</p>
+<ul>
+<li>邊界例子：client 在 00:59 發 10 次，在 01:00 再發 10 次。Fixed Window 會把兩批分屬不同分鐘而放行 20 次，交界處約 2 倍流量；Sliding Window 會看見前一批仍在最近 60 秒內而拒絕第二批。</li>
+</ul>
+<p><strong>實際應用</strong>：合約明確承諾 rolling 上限、anti-abuse 與登入保護、單一 endpoint 的精確短期控制。</p>
+<p><strong>代價</strong>：精準版本需要保存更多 timestamp state，或改用近似的 sliding-window counter；高 QPS 與大量 key 下要考慮記憶體、TTL、sharding 與原子計數。</p>
+<blockquote>
+<p>Use Sliding Window when the product requires a strict limit over any rolling time interval, not merely an approximate average rate.</p>
+</blockquote>
+<h2 id="token-bucketredis-state-與原子判定">Token Bucket：Redis State 與原子判定</h2>
+<p><strong>Bucket state 只保存可變計數</strong>：每個 <code>API key + endpoint group</code> 保存剩餘 token 與 <code>lastRefillMs</code>；capacity、refill rate 與 request cost 從設定服務或快取取得。</p>
+<p><strong>每次請求先 refill，再判定與扣除</strong>：</p>
+<span class="katex-display"><span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mtext>refilled</mtext><mo>=</mo><mi>min</mi><mo>⁡</mo><mo stretchy="false">(</mo><mtext>capacity</mtext><mo separator="true">,</mo><mtext>oldTokens</mtext><mo>+</mo><mtext>elapsedMs</mtext><mo>×</mo><mtext>refillRate</mtext><mi mathvariant="normal">/</mi><mn>1000</mn><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">\text{refilled} = \min(\text{capacity}, \text{oldTokens} + \text{elapsedMs} \times \text{refillRate} / 1000)</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord">refilled</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop">min</span><span class="mopen">(</span><span class="mord text"><span class="mord">capacity</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">oldTokens</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">elapsedMs</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">refillRate</span></span><span class="mord">/1000</span><span class="mclose">)</span></span></span></span></span>
+<p>若 <code>refilled >= requestCost</code>，扣除 cost 並放行；否則拒絕。bucket 不存在時可視為滿 bucket。</p>
+<p><strong>Lua script 保證同一 region 的原子性</strong>：<code>GET → application calculation → SET</code> 會讓兩個並發 request 都讀到最後一個 token 而同時放行。把「讀 state、refill、判定、扣 token、設定 TTL、回傳結果」包成單一 Redis Lua script，並使用 Redis server time 降低 gateway clock skew 的不公平。</p>
+<p><strong>回傳與 client contract</strong>：<code>allowed</code>、<code>remainingTokens</code>、<code>retryAfterMs</code>、<code>limit</code>、<code>resetAt</code>。拒絕時回 HTTP 429，附 <code>Retry-After</code>、remaining quota 與 reset time headers。</p>
+<p><strong>TTL 與回收</strong>：TTL 約為 bucket 從空補滿所需時間加上 buffer，避免不活躍 key 長期占用記憶體。</p>
+<span class="katex-display"><span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mtext>TTL</mtext><mo>≈</mo><mfrac><mtext>capacity</mtext><mtext>refillRate</mtext></mfrac></mrow><annotation encoding="application/x-tex">\text{TTL} \approx \frac{\text{capacity}}{\text{refillRate}}</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord">TTL</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0309em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3449em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord">refillRate</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord">capacity</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span>
+<h2 id="多維度-key-與熱點">多維度 Key 與熱點</h2>
+<p><strong>每個維度一個 bucket，全部通過才放行</strong>：API、商戶、domain、region 各有自己的 key，例如 <code>rl:{merchant:m42}:api:POST/orders</code>。在同一個 Lua script 裡先檢查所有 bucket、再一起扣除，避免某個維度已扣、另一個維度卻拒絕。</p>
+<p><strong>Redis Cluster 的 slot 限制</strong>：一個 Lua script 只能操作同一個 slot 的 key。用 hash tag <code>{merchant:m42}</code> 讓同一商戶的各維度落在同一個 slot；domain、region 這類共用 key 分開呼叫，或改用本地近似計數。</p>
+<p><strong>熱點 key 的處理</strong>：大商戶或全域 region 的 key 會集中打到同一個 shard。常見做法是 local token lease（一次向 Redis 預取一批 token 在本地扣）、把 key 拆成 N 個子 bucket 各分 1/N 額度，或對共用維度改用本地近似限流再定期同步。代價是可能短暫超限，誤差必須可觀測。</p>
+<h2 id="globalmulti-region-與-quota-分配">Global：Multi-region 與 Quota 分配</h2>
+<p><strong>Per-region 與 global limit 是不同語意</strong>：各 region 使用本地 Redis 延遲最低、故障隔離最好，但同一 client 跨區請求會放大全域額度。先決定可接受多少 over-admission、跨區延遲與單點風險。</p>
+<p><strong>三種協調強度對應不同 endpoint 風險</strong>：per-region limit 適合可容忍誤差；強一致 global counter 適合低 QPS、高價值且不能超限的操作；quota allocation 由中央控制面發 regional leases、在本地快速判定，是常見折衷。</p>
+<p><strong>熱路徑保持本地，誤差必須可量化</strong>：一般 API 平台採 regional Token Bucket 加 centrally allocated quota。資料面維持低延遲，控制面管理公平性、quota 補貨與 rule propagation，並讓 lease 誤差可觀測。</p>
+<h2 id="failure-handling-與-observability">Failure Handling 與 Observability</h2>
+<p><strong>Failure policy 依 endpoint 風險選擇</strong>：Redis、config service 或 quota control plane 失敗時，高風險、付費或易 abuse 的 endpoint 採 fail closed；低風險讀取可短暫 fail open；也可退回保守的 local static limit。Redis 呼叫設 5–10ms timeout 加 circuit breaker：滑動時間窗內錯誤率超過門檻就切到本地 1/N 額度，half-open 時放少量請求探測恢復。</p>
+<p><strong>Client contract 必須避免 retry storm</strong>：超限回 <code>429</code>，附 <code>Retry-After</code>、remaining quota、limit 與 reset time，讓 client 使用 backoff 加 jitter。</p>
+<p><strong>觀測同時證明保護與公平</strong>：量測 allow／reject rate、decision latency、error rate、bucket remaining、quota lease、over-admission、config propagation、top rejected clients 與熱點 endpoint。每個 global 誤差都要可量化與可觀測。</p></article></main></body></html>
