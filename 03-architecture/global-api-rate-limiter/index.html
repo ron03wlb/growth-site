@@ -1,0 +1,972 @@
+<!DOCTYPE html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Global API Rate Limiter 設計 · Ron's Growth</title><link rel="stylesheet" href="/growth-site/_astro/Base.BaEQ_gfx.css"></head><body><header class="site-header"><a class="brand" href="/growth-site/">Ron's Growth</a><nav><a href="/growth-site/03-architecture/">架構層</a><a href="/growth-site/canvas/">白板</a></nav></header><main class="narrow"><p class="crumbs"><a href="/growth-site/03-architecture/">架構層</a></p><h1>Global API Rate Limiter 設計</h1><p class="map-link"><a href="/growth-site/03-architecture/canvas/global-api-rate-limiter/">◇ 在白板上檢視「Global API Rate Limiter」</a></p><article class="prose"><h2 id="設計入口與需求邊界">設計入口與需求邊界</h2>
+<p><strong>先分清三件事</strong>：需求問題用來確認必要的限制與行為；設計假設是在資訊不足時明示暫定前提；設計選擇才是依需求決定 key、演算法、儲存與跨區協調。不要直接假設以 IP 限流，也不要先挑演算法。</p>
+<p>需求問答有三個並列面向，不是執行步驟：<a href="/growth-site/03-architecture/global-api-rate-limiter/#%E9%99%90%E6%B5%81%E5%A5%91%E7%B4%84%E9%99%90%E5%88%B6%E8%AA%B0%E8%B6%85%E9%99%90%E6%80%8E%E9%BA%BC%E8%BE%A6">限流契約：限制誰，超限怎麼辦？</a>、<a href="/growth-site/03-architecture/global-api-rate-limiter/#%E6%B5%81%E9%87%8F%E8%AA%9E%E6%84%8F%E5%85%81%E8%A8%B1-burst%E9%82%84%E6%98%AF%E5%9A%B4%E6%A0%BC%E6%99%82%E9%96%93%E7%AA%97">流量語意：允許 burst，還是嚴格時間窗？</a>、<a href="/growth-site/03-architecture/global-api-rate-limiter/#%E5%85%A8%E5%9F%9F%E8%AA%9E%E6%84%8F%E8%B7%A8%E5%8D%80%E5%85%B1%E4%BA%AB%E5%A4%9A%E5%B0%91%E9%A1%8D%E5%BA%A6%E8%A6%8F%E5%89%87%E5%A4%9A%E4%B9%85%E7%94%9F%E6%95%88">全域語意：跨區共享多少額度，規則多久生效？</a>。</p>
+<p><strong>責任邊界</strong>：DNS、Global Load Balancer 或 routing layer 決定 client 前往哪個 region；Rate Limiter 依規則判定請求是否可進入，保護可用性、公平性與下游容量。</p>
+<p><strong>推薦路徑</strong>（由左往右）：先釐清需求 → 選型卡與其下的演算法區（五種演算法是並列選項，不是執行步驟）→ Token Bucket 單區實作 → 其下的邏輯架構把系統分成資料面與控制面：資料面往右看多維度 Key 與熱點，控制面往下看全域協調、Quota Lease、完整判定路徑與失敗處理。其他四種演算法的實作是 Token Bucket 實作右側的平行分支，用來比較判定路徑差異。容量估算往下延伸到攻擊防禦區（分層防禦、Edge／WAF、Login／OTP 濫用型限流）。</p>
+<h2 id="限流契約限制誰超限怎麼辦">限流契約：限制誰，超限怎麼辦？</h2>
+<p><strong>要確認的事</strong>：限流的對象，以及用完額度後對 client 的承諾。</p>
+<h3 id="主要限流身分是什麼">主要限流身分是什麼？</h3>
+<blockquote>
+<p>What is the primary rate-limit identity?</p>
+<p>Should we limit by API key, tenant, user, IP address, endpoint, or a combination?</p>
+</blockquote>
+<p><strong>影響的決策</strong>：counter key、租戶公平性與資料分區方式。外部 API 平台通常優先考慮 API key 或 tenant；多個使用者可能共用 NAT IP，只以 IP 限流可能誤傷合法流量。</p>
+<h3 id="超限後怎麼處理">超限後怎麼處理？</h3>
+<blockquote>
+<p>What should happen when a client exceeds the limit?</p>
+<p>Should we reject immediately with HTTP 429 and a Retry-After header, queue requests, or degrade service?</p>
+</blockquote>
+<p><strong>影響的決策</strong>：client retry behavior、下游負載、API contract 與可觀測性。</p>
+<h2 id="流量語意允許-burst還是嚴格時間窗">流量語意：允許 burst，還是嚴格時間窗？</h2>
+<p><strong>要確認的事</strong>：短暫尖峰是否可接受，以及限制要精確到什麼程度。這兩項需求是演算法選擇的依據，不是先選演算法再補理由。</p>
+<blockquote>
+<p>Should clients be allowed to send short bursts, as long as their average request rate stays within the plan limit?</p>
+</blockquote>
+<p><strong>影響的決策</strong>：是否需要允許短暫 burst，以及是否適合採用 Token Bucket。</p>
+<blockquote>
+<p>Do we need an exact limit over a rolling time window, or is approximate enforcement acceptable?</p>
+</blockquote>
+<p><strong>影響的決策</strong>：限流精確度、儲存與計算成本，以及請求延遲。例如「任何連續 60 秒不得超過 1,000 次」比「每分鐘大致不超過 1,000 次」更嚴格。</p>
+<h2 id="全域語意跨區共享多少額度規則多久生效">全域語意：跨區共享多少額度，規則多久生效？</h2>
+<p><strong>要確認的事</strong>：限額的跨區範圍，以及設定更新容許多長的傳播時間。</p>
+<blockquote>
+<p>Do we need global limits across all regions, per-region limits, or both?</p>
+</blockquote>
+<p><strong>影響的決策</strong>：region 是否必須共享計數器、跨 region 延遲，以及可接受的一致性誤差。要明確詢問是否容許短暫超限或跨區協調延遲。</p>
+<blockquote>
+<p>How quickly must rule changes take effect?</p>
+</blockquote>
+<p><strong>影響的決策</strong>：config propagation、cache 策略，以及是否容許短時間使用舊規則。跨區額度判定不等於導流，見 <a href="/growth-site/03-architecture/global-api-rate-limiter/#%E8%A8%AD%E8%A8%88%E5%85%A5%E5%8F%A3%E8%88%87%E9%9C%80%E6%B1%82%E9%82%8A%E7%95%8C">設計入口與需求邊界</a>。</p>
+<h2 id="容量估算與-hot-path-狀態">容量估算與 Hot Path 狀態</h2>
+<p><strong>先分清 hot path 狀態與 request log</strong>：每次判定只需要 bucket state（剩餘 token、lastRefill）。IP、device、browser 等 request metadata 屬於稽核或分析 log，非同步寫入 ELK、ClickHouse 或 object storage，不進入判定路徑。</p>
+<p><strong>狀態量以 active key 估算</strong>：每個 key 的欄位約 32 bytes，加上 Redis 每個 key 約 50–100 bytes 的額外開銷；100 萬個 active key 約 100MB 級，單一 Redis node 就能容納。TTL 約為 capacity ÷ refillRate，讓閒置 key 自動回收。</p>
+<p><strong>吞吐與延遲預算決定 Redis 規模</strong>：Redis ops/s ≈ 峰值 QPS × 每個 request 檢查的維度數，例如 10k QPS × 4 個維度（API、商戶、domain、region，見 <a href="/growth-site/03-architecture/global-api-rate-limiter/#%E5%A4%9A%E7%B6%AD%E5%BA%A6-key%E5%85%88%E4%BE%9D%E5%9F%BA%E6%95%B8%E5%88%86%E9%A1%9E">多維度 Key：先依基數分類</a>）= 40k ops/s。limiter 加在每個 request 上，判定預算通常只有個位數 ms，所以 Redis 呼叫要設短 timeout，並且就近部署。</p>
+<h2 id="rate-limiting-演算法burst平滑與時間窗計數">Rate Limiting 演算法：burst、平滑與時間窗計數</h2>
+<p><strong>五種演算法，三種語意</strong>：先依需求選語意，再依精準度與 state 成本選實作。</p>
+<table>
+<thead>
+<tr>
+<th>語意</th>
+<th>演算法</th>
+<th>每個 key 的 state</th>
+<th>適合</th>
+<th>代價</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>允許有限 burst</td>
+<td>Token Bucket</td>
+<td>tokens、lastRefill</td>
+<td>API gateway 的 admission control</td>
+<td>要決定 refill rate 與 bucket size；分散式計數要原子</td>
+</tr>
+<tr>
+<td>平滑下游吞吐</td>
+<td>Leaky Bucket</td>
+<td>有限 queue</td>
+<td>payment、email、非同步 worker、第三方 API</td>
+<td>排隊延遲；queue 滿時仍要拒絕、丟棄或降級</td>
+</tr>
+<tr>
+<td>時間窗計數</td>
+<td>Fixed Window Counter</td>
+<td>1 個計數</td>
+<td>每日／每月配額、低風險 endpoint</td>
+<td>窗口交界可能放行約 2 倍</td>
+</tr>
+<tr>
+<td>時間窗計數</td>
+<td>Sliding Window Counter</td>
+<td>2 個計數</td>
+<td>高 QPS、大量 key 的一般 API</td>
+<td>近似值，前一窗口分布不均時有誤差</td>
+</tr>
+<tr>
+<td>時間窗計數</td>
+<td>Sliding Window Log</td>
+<td>窗內每筆 timestamp</td>
+<td>上限小、必須精確，例如登入失敗次數</td>
+<td>記憶體隨上限成長</td>
+</tr>
+</tbody>
+</table>
+<p><strong>易混淆的比較</strong>：<a href="/growth-site/03-architecture/global-api-rate-limiter/#%E6%AF%94%E8%BC%83token-bucket-%E8%88%87-leaky-bucket%E8%A3%9D%E9%A1%8D%E5%BA%A6%E9%82%84%E6%98%AF%E8%A3%9D%E8%AB%8B%E6%B1%82">比較｜Token Bucket 與 Leaky Bucket：裝額度還是裝請求</a>、<a href="/growth-site/03-architecture/global-api-rate-limiter/#%E6%AF%94%E8%BC%83%E4%B8%89%E7%A8%AE%E6%99%82%E9%96%93%E7%AA%97%E8%A8%88%E6%95%B8fixedsliding-countersliding-log">比較｜三種時間窗計數：Fixed、Sliding Counter、Sliding Log</a>。</p>
+<p><strong>實作路徑差異</strong>：<a href="/growth-site/03-architecture/global-api-rate-limiter/#%E6%AF%94%E8%BC%83%E4%BA%94%E7%A8%AE%E6%BC%94%E7%AE%97%E6%B3%95%E7%9A%84%E5%96%AE%E5%8D%80%E5%AF%A6%E4%BD%9C%E8%B7%AF%E5%BE%91">比較｜五種演算法的單區實作路徑</a>。主路徑選 Token Bucket，往右看它的 Redis 實作；其他四種的實作在 Token Bucket 實作區的右側。</p>
+<p><strong>可以組合，不必五選一</strong>：同步 API 用 Token Bucket 保護准入，非同步工作再用 queue-based shaper 平滑。</p>
+<h2 id="token-bucket允許有限的短暫-burst">Token Bucket：允許有限的短暫 burst</h2>
+<p><strong>核心想法</strong>：bucket 內有 token，token 依固定速率補充。每個 request 消耗一個 token；有 token 就通過，沒有就拒絕或等待。bucket 的容量限制最多可累積多少未使用額度。</p>
+<ul>
+<li>例：capacity = 10，refill rate = 10 requests/minute。滿 bucket 的 client 可以在瞬間送出 10 個 request，但之後必須等待 token 逐步補回。</li>
+<li>它限制的是長期平均速率，同時容許有上限的短暫尖峰。</li>
+</ul>
+<p><strong>實際應用</strong>：</p>
+<ul>
+<li>Public API gateway，讓合法 client 在短暫 burst 時不會立刻失敗。</li>
+<li>依 API key、tenant、user 或 endpoint 執行不同方案的 quotas。</li>
+<li>Login、password reset 等 endpoint 的 abuse protection，允許少量正常重試但阻擋持續攻擊。</li>
+</ul>
+<p><strong>實作</strong>：<a href="/growth-site/03-architecture/global-api-rate-limiter/#token-bucketredis-state-%E8%88%87-refill-%E5%88%A4%E5%AE%9A">Token Bucket：Redis State 與 Refill 判定</a>。</p>
+<blockquote>
+<p>Use Token Bucket when we need to enforce a long-term average rate while allowing bounded short bursts.</p>
+</blockquote>
+<h2 id="leaky-bucket以固定節奏保護下游">Leaky Bucket：以固定節奏保護下游</h2>
+<p><strong>核心想法</strong>：請求先進入一個有限 queue，再以近似固定速率流向下游。輸出速率比瞬間輸入速率更重要；queue 滿時，新請求必須被拒絕、丟棄，或採取其他明確策略。</p>
+<ul>
+<li>例：client 在同一秒送來 10 個工作，但 worker 每 6 秒只取出 1 個。下游看到的是穩定流量，不是瞬間的尖峰。</li>
+<li>它本質上是 traffic shaping，不只決定 request 能否進入，也控制工作送往下游的節奏。</li>
+</ul>
+<p><strong>實際應用</strong>：</p>
+<ul>
+<li>保護吞吐固定或成本昂貴的下游，例如 payment processor、email provider、第三方 API。</li>
+<li>非同步 job pipeline，將突然增加的工作平滑地交給 worker。</li>
+<li>寫入資料庫、發送通知或執行批次任務前的節流。</li>
+</ul>
+<p><strong>限制與提醒</strong>：</p>
+<ul>
+<li>同步 API 不宜長時間排隊，否則 client 可能 timeout，服務也會累積連線與記憶體壓力。</li>
+<li>常見做法是 gateway 先用 Token Bucket admission control，再對非同步工作使用 queue-based shaping。</li>
+</ul>
+<p><strong>實作</strong>：<a href="/growth-site/03-architecture/global-api-rate-limiter/#leaky-bucket-%E5%AF%A6%E4%BD%9C%E7%9C%9F%E7%9A%84%E6%8E%92%E9%9A%8Aqueue-%E7%89%88%E6%88%96%E5%8F%AA%E7%94%A8%E6%99%82%E9%96%93%E8%A8%88%E7%AE%97meter-%E7%89%88">Leaky Bucket 實作：真的排隊（Queue 版）或只用時間計算（Meter 版）</a>。</p>
+<blockquote>
+<p>Use a Leaky Bucket or queue-based shaper when the downstream system needs a predictable, smoothed request rate.</p>
+</blockquote>
+<h2 id="比較token-bucket-與-leaky-bucket裝額度還是裝請求">比較｜Token Bucket 與 Leaky Bucket：裝額度還是裝請求</h2>
+<p>兩者都叫 bucket，但桶裡裝的東西不同：一個裝額度，一個裝請求。</p>
+<table>
+<thead>
+<tr>
+<th>比較</th>
+<th>Token Bucket</th>
+<th>Leaky Bucket</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>控制什麼</td>
+<td>准入速率（admission control）</td>
+<td>送往下游的速率（traffic shaping）</td>
+</tr>
+<tr>
+<td>桶裡裝什麼</td>
+<td>未使用的額度 token</td>
+<td>等待處理的 request</td>
+</tr>
+<tr>
+<td>遇到 burst</td>
+<td>有 token 就立即放行，最多 B 個</td>
+<td>先進 queue，再以固定速率送出</td>
+</tr>
+<tr>
+<td>超限時</td>
+<td>立即拒絕，回 429</td>
+<td>queue 未滿就排隊；滿了才拒絕或丟棄</td>
+</tr>
+<tr>
+<td>對延遲的影響</td>
+<td>不增加延遲</td>
+<td>增加排隊延遲</td>
+</tr>
+<tr>
+<td>參數</td>
+<td>補充速率 r、容量 B</td>
+<td>流出速率、queue 長度</td>
+</tr>
+<tr>
+<td>下游看到的流量</td>
+<td>仍可能有尖峰（最多 B）</td>
+<td>平穩</td>
+</tr>
+</tbody>
+</table>
+<p>一句話記：Token Bucket 決定「能不能進」，Leaky Bucket 決定「多快送出」。</p>
+<h2 id="fixed-window-counter最簡單但交界處會放大流量">Fixed Window Counter：最簡單，但交界處會放大流量</h2>
+<p><strong>核心想法</strong>：把時間切成固定窗口（例如每分鐘），每個 client 每個窗口一個計數器；request 進來就加一，超過上限就拒絕，窗口結束後歸零。</p>
+<ul>
+<li>每個 key 只有一個整數，state 最小。實作見 <a href="/growth-site/03-architecture/global-api-rate-limiter/#fixed-window-counter-%E5%AF%A6%E4%BD%9Cincr-%E8%88%87-expire">Fixed Window Counter 實作：INCR 與 EXPIRE</a>。</li>
+<li>邊界問題：上限 10 次／分鐘時，client 在 00:59 與 01:00 各送 10 次，兩批分屬不同窗口而全部放行，短短 2 秒內通過 20 次，約為上限的 2 倍。想保留小 state 又避開這個問題，改用 <a href="/growth-site/03-architecture/global-api-rate-limiter/#sliding-window-counter%E7%94%A8%E5%85%A9%E5%80%8B%E5%9B%BA%E5%AE%9A%E7%AA%97%E5%8F%A3%E8%BF%91%E4%BC%BC%E6%BB%91%E5%8B%95%E7%AA%97%E5%8F%A3">Sliding Window Counter：用兩個固定窗口近似滑動窗口</a>。</li>
+</ul>
+<p><strong>實際應用</strong>：</p>
+<ul>
+<li>以自然日或自然月計算的帳單 quota。</li>
+<li>內部服務、可容忍邊界誤差的低風險 endpoint。</li>
+</ul>
+<blockquote>
+<p>Use Fixed Window Counter when simplicity and minimal state matter more than precision at window boundaries.</p>
+</blockquote>
+<h2 id="sliding-window-counter用兩個固定窗口近似滑動窗口">Sliding Window Counter：用兩個固定窗口近似滑動窗口</h2>
+<p><strong>核心想法</strong>：只保存目前與前一個固定窗口的計數，再把前一窗口仍落在滑動窗口內的部分按比例加權：</p>
+<span class="katex-display"><span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mtext>estimated</mtext><mo>=</mo><mtext>currentCount</mtext><mo>+</mo><mtext>previousCount</mtext><mo>×</mo><mtext>previousWindowOverlapRatio</mtext></mrow><annotation encoding="application/x-tex">\text{estimated} = \text{currentCount} + \text{previousCount} \times \text{previousWindowOverlapRatio}</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord">estimated</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord">currentCount</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">previousCount</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">previousWindowOverlapRatio</span></span></span></span></span></span>
+<p>重疊比例 = 1 − 目前窗口已經過的比例。</p>
+<ul>
+<li>例：上限 10 次／分鐘，前一分鐘 8 次，目前這分鐘已過 25%、已有 3 次；估計值 = 3 + 8 × 0.75 = 9，仍可放行。</li>
+</ul>
+<p><strong>跟 Fixed Window Counter 的差別</strong>：兩者的 state 幾乎相同（Fixed 存 1 個計數，Counter 存 2 個），差別在判斷時有沒有看前一窗口。Fixed 一進新窗口就從 0 開始；Counter 讓前一窗口的計數隨時間逐步釋放。</p>
+<p><strong>延伸</strong>：<a href="/growth-site/03-architecture/global-api-rate-limiter/#%E9%82%8A%E7%95%8C%E6%83%85%E5%A2%83%E4%B8%89%E7%A8%AE%E6%99%82%E9%96%93%E7%AA%97%E5%9C%A8-0100-%E8%88%87-0130-%E6%80%8E%E9%BA%BC%E5%88%A4">邊界情境：三種時間窗在 01:00 與 01:30 怎麼判</a>、<a href="/growth-site/03-architecture/global-api-rate-limiter/#sliding-window-counter%E8%AA%A4%E5%B7%AE%E5%BE%9E%E5%93%AA%E8%A3%A1%E4%BE%86">Sliding Window Counter：誤差從哪裡來</a>。</p>
+<p><strong>實作</strong>：<a href="/growth-site/03-architecture/global-api-rate-limiter/#sliding-window-counter-%E5%AF%A6%E4%BD%9C%E5%85%A9%E5%80%8B%E7%AA%97%E5%8F%A3-key-%E5%8A%A0%E6%AC%8A">Sliding Window Counter 實作：兩個窗口 Key 加權</a>。</p>
+<p><strong>實際應用</strong>：</p>
+<ul>
+<li>高 QPS、大量 key 的一般 public API，想要滑動窗口的行為，但不想為每個 key 保存每筆 timestamp。</li>
+<li>CDN／edge 層的 per-IP rate rule，key 數量極大，只能負擔固定大小的 state。</li>
+</ul>
+<blockquote>
+<p>Use Sliding Window Counter when we want rolling-window behavior at fixed-window cost and can accept a small estimation error.</p>
+</blockquote>
+<h2 id="sliding-window-counter誤差從哪裡來">Sliding Window Counter：誤差從哪裡來</h2>
+<p>公式假設前一窗口的請求平均分布。</p>
+<table>
+<thead>
+<tr>
+<th>前一窗口的實際分布</th>
+<th>估計值相對真實值</th>
+<th>結果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>集中在窗口尾端（例如全在 00:59）</td>
+<td>偏低</td>
+<td>多放行；01:30 時真實滾動計數仍是 10，估計只有 5</td>
+</tr>
+<tr>
+<td>集中在窗口開頭（例如全在 00:01）</td>
+<td>偏高</td>
+<td>誤拒；01:00 時真實滾動計數已是 0，估計值仍是 10</td>
+</tr>
+<tr>
+<td>大致平均</td>
+<td>接近</td>
+<td>誤差小</td>
+</tr>
+</tbody>
+</table>
+<p>一般流量下誤差很小，但 client 刻意集中送出時仍可能短暫超限，所以必須精確的計數改用 Sliding Window Log。</p>
+<h2 id="sliding-window-log精準記錄最近一段連續時間的每筆請求">Sliding Window Log：精準記錄最近一段連續時間的每筆請求</h2>
+<p><strong>核心想法</strong>：規則是「任何連續 60 秒最多 10 次」時，每次請求都往回數前 60 秒實際放行了幾筆，而不是只看目前落在哪一個固定分鐘。為了數得精準，每筆放行的 request 都記下 timestamp。</p>
+<ul>
+<li>邊界例子：client 在 00:59 發 10 次，在 01:00 再發 10 次。Fixed Window 把兩批分屬不同分鐘而放行 20 次；Sliding Window Log 看見前一批的 10 筆 timestamp 仍在最近 60 秒內，拒絕第二批，直到 01:59 那批過期。</li>
+<li>它的價值是避免 client 利用固定時間窗邊界製造雙倍 burst，而且沒有估算誤差。</li>
+</ul>
+<p><strong>實作</strong>：Redis Sorted Set 保存 timestamp，見 <a href="/growth-site/03-architecture/global-api-rate-limiter/#sliding-window-log-%E5%AF%A6%E4%BD%9Csorted-set-%E5%88%A4%E5%AE%9A%E8%B7%AF%E5%BE%91%E8%88%87-retry-after">Sliding Window Log 實作：Sorted Set 判定路徑與 Retry-After</a>。</p>
+<p><strong>代價</strong>：每個 key 最多保存「上限」筆紀錄。上限 10 次／分鐘時很便宜；上限 10,000 次／分鐘又有大量 key 時，記憶體與每次清理的成本都高，這時改用 <a href="/growth-site/03-architecture/global-api-rate-limiter/#sliding-window-counter%E7%94%A8%E5%85%A9%E5%80%8B%E5%9B%BA%E5%AE%9A%E7%AA%97%E5%8F%A3%E8%BF%91%E4%BC%BC%E6%BB%91%E5%8B%95%E7%AA%97%E5%8F%A3">Sliding Window Counter：用兩個固定窗口近似滑動窗口</a>。</p>
+<p><strong>實際應用</strong>：</p>
+<ul>
+<li>上限小、必須精確的計數，例如登入失敗次數、OTP 驗證次數。</li>
+<li>合約或 plan 明確承諾「任何連續 60 秒」的用量上限。</li>
+<li>對單一 endpoint 需要精確控制短期呼叫量的情況。</li>
+</ul>
+<blockquote>
+<p>Use Sliding Window Log when the limit is small and must be exact over any rolling interval; it stores one timestamp per allowed request, so memory grows with the limit.</p>
+</blockquote>
+<h2 id="比較三種時間窗計數fixedsliding-countersliding-log">比較｜三種時間窗計數：Fixed、Sliding Counter、Sliding Log</h2>
+<p>三者都在數「一段時間內幾次」，差在數法與精準度。</p>
+<table>
+<thead>
+<tr>
+<th>比較</th>
+<th>Fixed Window Counter</th>
+<th>Sliding Window Counter</th>
+<th>Sliding Window Log</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>存什麼</td>
+<td>目前窗口 1 個計數</td>
+<td>目前與前一窗口 2 個計數</td>
+<td>窗內每筆放行 request 的 timestamp</td>
+</tr>
+<tr>
+<td>怎麼判斷</td>
+<td>目前計數 &#x3C; 上限</td>
+<td>目前計數 + 前一窗口計數 × 重疊比例 &#x3C; 上限</td>
+<td>窗內筆數 &#x3C; 上限</td>
+</tr>
+<tr>
+<td>窗口交界</td>
+<td>一進新窗口就歸零，可放行約 2 倍</td>
+<td>前一窗口的計數逐步釋放</td>
+<td>精準，前一批過期才釋放</td>
+</tr>
+<tr>
+<td>精準度</td>
+<td>交界誤差最大</td>
+<td>近似，假設前一窗口平均分布</td>
+<td>精準</td>
+</tr>
+<tr>
+<td>每個 key 的記憶體</td>
+<td>最小</td>
+<td>與 Fixed 同級</td>
+<td>最多「上限」筆紀錄</td>
+</tr>
+<tr>
+<td>典型場景</td>
+<td>每日／每月配額、低風險 endpoint</td>
+<td>高 QPS、大量 key 的一般 API</td>
+<td>登入失敗、OTP 驗證等小而精確的上限</td>
+</tr>
+</tbody>
+</table>
+<p>一句話記：Fixed 只看這一格；Sliding Counter 看這一格加上一格的一部分；Sliding Log 看每一筆。</p>
+<h2 id="邊界情境三種時間窗在-0100-與-0130-怎麼判">邊界情境：三種時間窗在 01:00 與 01:30 怎麼判</h2>
+<p>上限 10 次／分鐘，client 在 00:59 已送 10 次。</p>
+<table>
+<thead>
+<tr>
+<th>時間點</th>
+<th>Fixed Window Counter</th>
+<th>Sliding Window Counter</th>
+<th>Sliding Window Log</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>01:00 再送 10 次</td>
+<td>本窗口已用 0 → 全部放行，2 秒內通過 20 次</td>
+<td>0 + 10 × 1.0 = 10 → 拒絕</td>
+<td>窗內有 10 筆 → 拒絕</td>
+</tr>
+<tr>
+<td>01:30 再送 10 次</td>
+<td>本窗口已用 10 → 拒絕</td>
+<td>0 + 10 × 0.5 = 5 → 放行 5 次</td>
+<td>窗內仍有 10 筆 → 拒絕</td>
+</tr>
+</tbody>
+</table>
+<p>Fixed 在交界放行 2 倍；Sliding Counter 在 01:30 比精準值多放 5 次，原因見 <a href="/growth-site/03-architecture/global-api-rate-limiter/#sliding-window-counter%E8%AA%A4%E5%B7%AE%E5%BE%9E%E5%93%AA%E8%A3%A1%E4%BE%86">Sliding Window Counter：誤差從哪裡來</a>；Sliding Log 一直拒絕到 01:59。</p>
+<h2 id="token-bucketredis-state-與-refill-判定">Token Bucket：Redis State 與 Refill 判定</h2>
+<h3 id="1-bucket-state-只保存可變計數">1. Bucket state 只保存可變計數</h3>
+<p>每個 <code>API key + endpoint group</code> 保存剩餘 token 與 <code>lastRefillMs</code>。capacity、refill rate 與 request cost 從設定服務或快取取得，而不在每筆 bucket state 重複保存。</p>
+<h3 id="2-每次請求先-refill再判定與扣除">2. 每次請求先 refill，再判定與扣除</h3>
+<span class="katex-display"><span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mtext>refilled</mtext><mo>=</mo><mi>min</mi><mo>⁡</mo><mo stretchy="false">(</mo><mtext>capacity</mtext><mo separator="true">,</mo><mtext>oldTokens</mtext><mo>+</mo><mtext>elapsedMs</mtext><mo>×</mo><mtext>refillRate</mtext><mi mathvariant="normal">/</mi><mn>1000</mn><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">\text{refilled} = \min(\text{capacity}, \text{oldTokens} + \text{elapsedMs} \times \text{refillRate} / 1000)</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord">refilled</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop">min</span><span class="mopen">(</span><span class="mord text"><span class="mord">capacity</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">oldTokens</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">elapsedMs</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">refillRate</span></span><span class="mord">/1000</span><span class="mclose">)</span></span></span></span></span>
+<p>若 <code>refilled >= requestCost</code>，扣除 cost 並放行；否則拒絕。bucket 不存在時可視為滿 bucket，因為該 client 已長時間沒有使用額度。</p>
+<p><strong>延伸</strong>：<a href="/growth-site/03-architecture/global-api-rate-limiter/#token-bucketlua-script-%E5%8E%9F%E5%AD%90%E5%88%A4%E5%AE%9A%E8%88%87%E5%9B%9E%E5%82%B3">Token Bucket：Lua Script 原子判定與回傳</a>、<a href="/growth-site/03-architecture/global-api-rate-limiter/#token-bucketttl-%E5%9B%9E%E6%94%B6%E9%96%92%E7%BD%AE-key">Token Bucket：TTL 回收閒置 Key</a>。</p>
+<h2 id="token-bucketlua-script-原子判定與回傳">Token Bucket：Lua Script 原子判定與回傳</h2>
+<h3 id="1-為什麼要-lua-script">1. 為什麼要 Lua script</h3>
+<p>如果 gateway 用 <code>GET → application calculation → SET</code>，兩個並發 request 可能都讀到最後一個 token，並同時放行。</p>
+<p>將「讀 state、refill、判定、扣 token、設定 TTL、回傳結果」包成單一 Redis Lua script，可以避免同一 Redis instance 上的 race condition。建議在 script 使用 Redis server time，降低 gateway clock skew 的不公平。</p>
+<h3 id="2-回傳與-client-contract">2. 回傳與 client contract</h3>
+<ul>
+<li><code>allowed</code></li>
+<li><code>remainingTokens</code></li>
+<li><code>retryAfterMs</code></li>
+<li><code>limit</code></li>
+<li><code>resetAt</code> 或等價時間</li>
+</ul>
+<p>Gateway 在拒絕時回 HTTP 429，並加入 <code>Retry-After</code>、remaining quota 與 reset time 等 headers。</p>
+<h2 id="token-bucketttl-回收閒置-key">Token Bucket：TTL 回收閒置 Key</h2>
+<p>TTL 可約為 bucket 從空補滿所需時間，加上 buffer：</p>
+<span class="katex-display"><span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mtext>TTL</mtext><mo>≈</mo><mfrac><mtext>capacity</mtext><mtext>refillRate</mtext></mfrac></mrow><annotation encoding="application/x-tex">\text{TTL} \approx \frac{\text{capacity}}{\text{refillRate}}</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord">TTL</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0309em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3449em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord">refillRate</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord">capacity</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span>
+<p>這避免大量不活躍 API key 長期占用 Redis 記憶體。Key 過期後再出現時視為滿 bucket，結果與一直保存相同。</p>
+<h2 id="邏輯架構資料面與控制面分開">邏輯架構：資料面與控制面分開</h2>
+<pre><code>                 ┌──────────── 控制面（全域，不在請求路徑上）────────────┐
+                 │  Rule Service      規則與版本（限制誰、多少、成本）   │
+                 │  Quota Allocator   依各區需求發 regional lease       │
+                 │  Usage Aggregator  收各區用量，算全域超放量           │
+                 └──────▲ 回報用量 / ▼ 推送規則與 lease ──────────────────┘
+                        │
+ Client → DNS/GLB → Region A ─────────────────────────────────────────────
+                    Edge/WAF → API Gateway ──────────────→ 業務服務
+                               └ Limiter 模組
+                                  ├ 規則快取（本地）
+                                  ├ 本地計數 / 預取的 token
+                                  └→ Regional Redis Cluster（bucket state）
+</code></pre>
+<p><strong>判定請求的路徑只在本區完成，同步的跨區呼叫一律不放在這條路徑上。</strong></p>
+<ul>
+<li><strong>資料面</strong>（gateway 裡的 limiter 加上本區 Redis）：個位數 ms 內判定允許或拒絕。</li>
+<li><strong>控制面</strong>（Rule Service、Quota Allocator、Usage Aggregator）：規則、跨區額度分配與全域用量；非同步運作，掛掉時資料面沿用最後拿到的規則與 lease。</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>問題</th>
+<th>落在哪一面</th>
+<th>段落</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>本區的 key 怎麼切、單一 shard 怎麼不被打爆</td>
+<td>資料面</td>
+<td><a href="/growth-site/03-architecture/global-api-rate-limiter/#%E5%A4%9A%E7%B6%AD%E5%BA%A6-key%E5%85%88%E4%BE%9D%E5%9F%BA%E6%95%B8%E5%88%86%E9%A1%9E">多維度 Key：先依基數分類</a>、<a href="/growth-site/03-architecture/global-api-rate-limiter/#%E7%86%B1%E9%BB%9E-key%E5%88%A4%E6%96%B7%E4%BE%86%E6%BA%90%E4%BE%9D%E8%AA%A4%E5%B7%AE%E6%96%B9%E5%90%91%E9%81%B8%E8%A7%A3%E6%B3%95">熱點 Key：判斷來源，依誤差方向選解法</a></td>
+</tr>
+<tr>
+<td>全域額度怎麼分到各區</td>
+<td>控制面</td>
+<td><a href="/growth-site/03-architecture/global-api-rate-limiter/#global-rate-limiter%E4%BA%8B%E5%89%8D%E5%88%86%E9%85%8D%E9%82%84%E6%98%AF%E4%BA%8B%E5%BE%8C%E5%B0%8D%E5%B8%B3">Global Rate Limiter：事前分配還是事後對帳</a>、<a href="/growth-site/03-architecture/global-api-rate-limiter/#global-rate-limiterquota-lease-%E7%9A%84%E5%88%86%E9%85%8D%E5%88%B0%E6%9C%9F%E8%88%87%E6%95%85%E9%9A%9C">Global Rate Limiter：Quota Lease 的分配、到期與故障</a></td>
+</tr>
+</tbody>
+</table>
+<p>兩面串起來的流程見 <a href="/growth-site/03-architecture/global-api-rate-limiter/#%E4%B8%80%E5%80%8B%E8%AB%8B%E6%B1%82%E7%9A%84%E5%AE%8C%E6%95%B4%E5%88%A4%E5%AE%9A%E8%B7%AF%E5%BE%91">一個請求的完整判定路徑</a>。</p>
+<blockquote>
+<p>Keep the decision path inside the region: the data plane decides in milliseconds with local rules and leases, and the control plane distributes rules and quota asynchronously, so a control-plane outage degrades accuracy, not availability.</p>
+</blockquote>
+<h2 id="多維度-key先依基數分類">多維度 Key：先依基數分類</h2>
+<h3 id="1-一個請求命中多條規則全部通過才放行">1. 一個請求命中多條規則，全部通過才放行</h3>
+<pre><code>請求 → 比對規則 → [(key, limit, cost), ...] → 逐一判定 → 全部通過才放行
+</code></pre>
+<p>以 API、商戶、domain、region 四個維度為例（實際維度依 <a href="/growth-site/03-architecture/global-api-rate-limiter/#%E9%99%90%E6%B5%81%E5%A5%91%E7%B4%84%E9%99%90%E5%88%B6%E8%AA%B0%E8%B6%85%E9%99%90%E6%80%8E%E9%BA%BC%E8%BE%A6">限流契約：限制誰，超限怎麼辦？</a> 的需求決定）：商戶 m42 呼叫 <code>POST /orders</code>，同時命中「m42 總量」「m42 × POST /orders」「domain 總量」「region 總量」。每個維度各有自己的 key，例如 <code>rl:{merchant:m42}:api:POST/orders</code>。</p>
+<h3 id="2-依基數分類維度">2. 依基數分類維度</h3>
+<table>
+<thead>
+<tr>
+<th>類型</th>
+<th>例子</th>
+<th>key 數量</th>
+<th>每個 key 的 QPS</th>
+<th>天生的問題</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>高基數、專屬於某個身分</td>
+<td>API key、user、商戶</td>
+<td>多</td>
+<td>低</td>
+<td>記憶體與 TTL 回收</td>
+</tr>
+<tr>
+<td>低基數、大家共用</td>
+<td>region、domain、整個 endpoint</td>
+<td>少</td>
+<td>極高</td>
+<td>天生就是熱點</td>
+</tr>
+<tr>
+<td>組合維度</td>
+<td>商戶 × API</td>
+<td>多</td>
+<td>中</td>
+<td>規則數量膨脹</td>
+</tr>
+</tbody>
+</table>
+<h3 id="3-分類決定-key-放在哪裡">3. 分類決定 key 放在哪裡</h3>
+<p>一個 Lua script 只能操作同一個 Redis Cluster slot 的 key。</p>
+<ul>
+<li><strong>身分維度</strong>：用 hash tag <code>{merchant:m42}</code> 讓同一商戶的各維度落在同一個 slot，在一個 Lua 裡先檢查所有 bucket、再一起扣除，避免某個維度已扣、另一個維度卻拒絕。</li>
+<li><strong>共用維度</strong>：不能和身分 key 放在同一個 slot，否則所有商戶的請求都擠到同一個 shard。改走本地近似計數或 lease。</li>
+</ul>
+<p>身分維度保護公平，要精確；共用維度保護總容量，近似即可。</p>
+<p><strong>延伸</strong>：<a href="/growth-site/03-architecture/global-api-rate-limiter/#%E5%A4%9A%E7%B6%AD%E5%BA%A6-key%E8%B7%A8-slot-%E7%84%A1%E6%B3%95%E5%8E%9F%E5%AD%90%E6%99%82%E7%9A%84%E5%8F%96%E6%8D%A8">多維度 Key：跨 slot 無法原子時的取捨</a>、<a href="/growth-site/03-architecture/global-api-rate-limiter/#%E7%86%B1%E9%BB%9E-key%E5%88%A4%E6%96%B7%E4%BE%86%E6%BA%90%E4%BE%9D%E8%AA%A4%E5%B7%AE%E6%96%B9%E5%90%91%E9%81%B8%E8%A7%A3%E6%B3%95">熱點 Key：判斷來源，依誤差方向選解法</a>。</p>
+<h2 id="多維度-key跨-slot-無法原子時的取捨">多維度 Key：跨 slot 無法原子時的取捨</h2>
+<p>規則命中的 key 分散在不同 Redis Cluster slot 時，無法用一個 Lua script 原子完成「全部檢查再一起扣」。</p>
+<table>
+<thead>
+<tr>
+<th>做法</th>
+<th>怎麼做</th>
+<th>代價</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>依序扣除，被拒時退還</td>
+<td>先扣 A，B 拒絕時把 A 加回去</td>
+<td>中間狀態短暫不一致，別的請求可能因此誤被拒</td>
+</tr>
+<tr>
+<td>先查便宜的再查貴的</td>
+<td>共用維度先用本地近似擋下；通過後再用 Redis Lua 處理身分維度</td>
+<td>共用維度只是近似值</td>
+</tr>
+<tr>
+<td>先檢查不扣，最後一次扣</td>
+<td>兩次往返</td>
+<td>延遲加倍，兩次之間仍有競爭</td>
+</tr>
+</tbody>
+</table>
+<p><strong>建議答法</strong>：身分維度放同一個 slot、用 Lua 原子判定；共用維度在本地近似處理。兩者精確度不同，因為保護的東西不同：身分維度保護公平，共用維度保護總容量。</p>
+<blockquote>
+<p>Identity dimensions share a hash-tagged slot and are checked atomically in one Lua script; shared dimensions like region are enforced approximately in local memory, because they protect total capacity rather than fairness.</p>
+</blockquote>
+<h2 id="熱點-key判斷來源依誤差方向選解法">熱點 Key：判斷來源，依誤差方向選解法</h2>
+<h3 id="1-什麼時候算熱點">1. 什麼時候算熱點</h3>
+<p>單一 Redis shard 約可處理 10 萬 ops/s；單一 key 的 QPS 接近 shard 容量的一成時就要處理。熱點有兩種來源：</p>
+<ul>
+<li>
+<p><strong>結構性熱點</strong>：低基數的共用維度，例如 region、domain，一定會熱。</p>
+</li>
+<li>
+<p><strong>偏斜熱點</strong>：某個大商戶的流量是其他商戶的上千倍。</p>
+</li>
+</ul>
+<h3 id="2-三種解法差在誤差往哪邊偏">2. 三種解法，差在誤差往哪邊偏</h3>
+<table>
+<thead>
+<tr>
+<th>解法</th>
+<th>機制</th>
+<th>Redis 負載</th>
+<th>誤差方向</th>
+<th>適合</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Local token lease（預取）</td>
+<td>gateway 一次向 Redis 拿 n 個 token，在本地扣，用完再拿</td>
+<td>降為約 1/n</td>
+<td>少放：token 卡在閒置的 gateway；lease 要設到期並歸還</td>
+<td>大商戶這類偏斜熱點</td>
+</tr>
+<tr>
+<td>拆成 N 個子 bucket</td>
+<td><code>key:0..N-1</code>，各分 limit/N，請求隨機打到其中一個</td>
+<td>分散到 N 個 shard</td>
+<td>提早拒絕：流量不均時某個子 bucket 先用完</td>
+<td>要較精確、但單一 key 扛不住</td>
+</tr>
+<tr>
+<td>本地計數加定期同步</td>
+<td>每台 gateway 自己計數，每 Δt 同步一次總數</td>
+<td>幾乎為 0</td>
+<td>多放：上限約為速率 × Δt</td>
+<td>共用維度，只需保護總量</td>
+</tr>
+</tbody>
+</table>
+<p>一句話記：<strong>預取 lease 少放，本地同步多放，拆分提早拒絕。</strong> 選哪一種，看這個維度能容忍哪一種錯。</p>
+<h3 id="3-試算預取-lease">3. 試算：預取 lease</h3>
+<p>商戶 m42 上限 50k/s，20 台 gateway。不處理時 50k ops/s 全部打在同一個 shard。每次預取 100 個 token，Redis 約降到 500 ops/s；最壞 20 × 100 = 2,000 個 token 卡在閒置的 gateway，約占每秒額度 4%，表現為少放。</p>
+<blockquote>
+<p>For a hot key I choose by error direction: prefetched leases under-admit, local counting with periodic sync over-admits, and splitting into sub-buckets rejects early when traffic is uneven.</p>
+</blockquote>
+<h2 id="比較五種演算法的單區實作路徑">比較｜五種演算法的單區實作路徑</h2>
+<table>
+<thead>
+<tr>
+<th>演算法</th>
+<th>Redis 結構</th>
+<th>每次請求的操作</th>
+<th>原子性</th>
+<th>Retry-After</th>
+<th>每個 key 的記憶體</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Token Bucket</td>
+<td>Hash：tokens、lastRefillMs</td>
+<td>讀 → refill → 判定 → 扣除 → 寫回</td>
+<td>Lua</td>
+<td>(cost − tokens) ÷ r</td>
+<td>固定，約 32 B 加 key 開銷</td>
+</tr>
+<tr>
+<td>Leaky Bucket（queue）</td>
+<td>List 或 MQ</td>
+<td>檢查長度 → 入列；consumer 固定速率取出</td>
+<td>Lua 或 MQ 的 queue 上限</td>
+<td>queue 長度 ÷ 流出速率</td>
+<td>隨排隊數成長</td>
+</tr>
+<tr>
+<td>Fixed Window</td>
+<td>String 整數</td>
+<td>INCR → 首次設 TTL → 比較</td>
+<td>INCR 原子；加 TTL 要 Lua</td>
+<td>窗口結束 − now</td>
+<td>1 個整數</td>
+</tr>
+<tr>
+<td>Sliding Window Counter</td>
+<td>2 個 String 整數</td>
+<td>讀兩個計數 → 加權 → 未超限才 INCR</td>
+<td>Lua</td>
+<td>解權重方程，或保守回到窗口結束</td>
+<td>2 個整數</td>
+</tr>
+<tr>
+<td>Sliding Window Log</td>
+<td>Sorted Set</td>
+<td>清窗外 → ZCARD → 未超限才 ZADD</td>
+<td>Lua</td>
+<td>最舊一筆 + 窗口 − now</td>
+<td>最多「上限」筆</td>
+</tr>
+</tbody>
+</table>
+<h3 id="實作路徑的三個分歧">實作路徑的三個分歧</h3>
+<ol>
+<li><strong>同步判定還是排隊</strong>：只有 Leaky Bucket 的 queue 版會改變 API 回應語意（<code>202</code> 加非同步結果）；其餘四種都是同步 allow／deny，超限回 <code>429</code>。</li>
+<li><strong>被拒絕的請求算不算</strong>：Fixed Window 的 INCR-first 寫法會把拒絕也算進去；其他都在 Lua 內先判定、通過才寫入。</li>
+<li><strong>能不能跨 region</strong>：計數型（Fixed、Sliding Counter）可以非同步加總；Token Bucket 用 quota lease；Sliding Log 需要每筆 timestamp，通常只做單區。</li>
+</ol>
+<h2 id="leaky-bucket-實作真的排隊queue-版或只用時間計算meter-版">Leaky Bucket 實作：真的排隊（Queue 版）或只用時間計算（Meter 版）</h2>
+<p>兩者差在 client 當下能不能拿到結果：Queue 版先收下、晚點給結果；Meter 版當場決定放行或拒絕。</p>
+<ul>
+<li><strong>Queue 版（traffic shaping）</strong>：request 或 job 寫入有界 queue（Redis List、RabbitMQ、Kafka、SQS），consumer 以固定速率取出送往下游。API 先回 <code>202 Accepted</code> 加 job id，結果非同步取得。</li>
+<li><strong>Meter 版（GCRA）</strong>：不真的排隊，每個 key 只存一個 TAT（theoretical arrival time），判斷「如果以固定速率流出，這個 request 還放不放得進桶」。行為等同 Token Bucket，可用在同步 API，例如 redis-cell 的 <code>CL.THROTTLE</code>。「Meter」來自經典分類 leaky bucket as a meter（相對於 as a queue），GCRA 是 ATM 網路標準化的寫法；它跟 Token Bucket 數學上等價，差在 state 只存一個時間點，不用另外算 refill。</li>
+</ul>
+<p><strong>延伸</strong>：<a href="/growth-site/03-architecture/global-api-rate-limiter/#leaky-bucket-%E5%AF%A6%E4%BD%9Cqueue-%E7%89%88%E7%9A%84%E5%88%A4%E5%AE%9A%E8%B7%AF%E5%BE%91%E8%88%87%E5%B7%AE%E7%95%B0">Leaky Bucket 實作：Queue 版的判定路徑與差異</a>。</p>
+<h2 id="leaky-bucket-實作queue-版的判定路徑與差異">Leaky Bucket 實作：Queue 版的判定路徑與差異</h2>
+<h3 id="1-判定路徑">1. 判定路徑</h3>
+<ol>
+<li>入列前檢查長度：在同一個 Lua script 內 <code>LLEN</code> 與 <code>RPUSH</code>，長度已達容量就拒絕；用 MQ 時改設 queue 上限，例如 RabbitMQ <code>x-max-length</code> 加 <code>overflow: reject-publish</code>。</li>
+<li>Consumer 控制流出速率：單一 consumer 固定間隔取出；多個 consumer 時每個分 1/N 速率，或共用一個中央 limiter。</li>
+<li>下游失敗時 retry 加 backoff，多次失敗進 DLQ。</li>
+</ol>
+<h3 id="2-跟-token-bucket-實作的差異">2. 跟 Token Bucket 實作的差異</h3>
+<p>Token Bucket 只記帳、當場判定，request 本身不留下；Queue 版把 request 本身留下來排隊。下面四點差異都從這裡來。</p>
+<table>
+<thead>
+<tr>
+<th>面向</th>
+<th>Token Bucket</th>
+<th>Queue 版</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>State</td>
+<td>固定兩個數字（tokens、lastRefillMs），不隨流量變大</td>
+<td>queue 本身，每個等待的 request 一個 entry，記憶體隨排隊數成長</td>
+</tr>
+<tr>
+<td>Client 當下拿到</td>
+<td>結果：<code>200</code> 或 <code>429</code></td>
+<td>已受理：<code>202</code> 加 job id，結果要查詢狀態或等 callback</td>
+</tr>
+<tr>
+<td><code>Retry-After</code></td>
+<td>(cost − tokens) ÷ refill rate</td>
+<td>queue 長度 ÷ 流出速率，例如排 30 個、每秒處理 5 個 ≈ 6 秒</td>
+</tr>
+<tr>
+<td>觀測重點</td>
+<td>allow／reject rate</td>
+<td>queue depth、等待時間、DLQ 數量</td>
+</tr>
+</tbody>
+</table>
+<p>比喻：Token Bucket 像門口發號碼牌，牌發完就請你下次再來，店裡只記剩幾張；Queue 版像讓你進來排隊並給取餐號碼，店裡要記每個在等的人，你也要等叫號才拿到餐。</p>
+<h2 id="fixed-window-counter-實作incr-與-expire">Fixed Window Counter 實作：INCR 與 EXPIRE</h2>
+<h3 id="1-state-是一個整數">1. State 是一個整數</h3>
+<p>Key 帶窗口編號，例如 <code>rl:{tenant:t7}:202610281405</code>，窗口編號 = floor(now ÷ 窗口長度)。Value 是本窗口已放行的次數。</p>
+<h3 id="2-判定路徑">2. 判定路徑</h3>
+<ol>
+<li><code>INCR key</code></li>
+<li>回傳值是 1（本窗口第一筆）時 <code>EXPIRE key 窗口長度</code></li>
+<li>回傳值 > 上限就拒絕</li>
+</ol>
+<p><code>INCR</code> 本身是原子的，但 <code>INCR</code> 與 <code>EXPIRE</code> 是兩個指令，中間失敗會留下沒有 TTL 的 key。把兩步包進 Lua script，或先 <code>SET key 0 EX ttl NX</code> 再 <code>INCR</code>。</p>
+<p>先加再比較的寫法會把被拒絕的 request 也算進去。Fixed Window 本來就粗略，通常可接受；要精確時改成 Lua 先判定、未超限才加。</p>
+<h3 id="3-retry-after">3. Retry-After</h3>
+<p><code>Retry-After</code> = 窗口結束時間 − now。所有 client 在同一個整點重置，會同時重試，client 端要加 jitter。</p>
+<h3 id="4-跨-region">4. 跨 region</h3>
+<p>計數只是整數，各 region 可以各自計數、非同步加總，或各自分配 1/N 額度。這是時間窗計數中最容易跨區的一種。</p>
+<h2 id="sliding-window-counter-實作兩個窗口-key-加權">Sliding Window Counter 實作：兩個窗口 Key 加權</h2>
+<h3 id="1-state-是兩個整數">1. State 是兩個整數</h3>
+<p>與 Fixed Window 相同的 key 格式，只是判定時同時讀目前與前一窗口：<code>rl:{tenant:t7}:&#x3C;目前窗口></code>、<code>rl:{tenant:t7}:&#x3C;前一窗口></code>。TTL 設為 2 個窗口長度，讓前一窗口在需要時仍讀得到。</p>
+<h3 id="2-判定路徑單一-lua-script">2. 判定路徑（單一 Lua script）</h3>
+<ol>
+<li><code>GET</code> 前一窗口計數 prev、目前窗口計數 curr</li>
+<li>重疊比例 = 1 − 目前窗口已經過的時間 ÷ 窗口長度</li>
+<li>estimated = curr + prev × 重疊比例</li>
+<li>estimated + cost ≤ 上限才 <code>INCR</code> 目前窗口並設 TTL，否則拒絕</li>
+</ol>
+<p>必須先判定再寫入，所以一定要用 Lua；不能像 Fixed Window 直接 <code>INCR</code> 再比較，否則被拒絕的 request 也會推高計數。</p>
+<h3 id="3-retry-after-1">3. Retry-After</h3>
+<p>前一窗口的權重隨時間線性下降，可以解出何時 estimated 降到上限以下：</p>
+<span class="katex-display"><span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mtext>elapsed</mtext><mo>≥</mo><mi>W</mi><mo>×</mo><mrow><mo fence="true">(</mo><mn>1</mn><mo>−</mo><mfrac><mrow><mtext>limit</mtext><mo>−</mo><mtext>cost</mtext><mo>−</mo><mtext>curr</mtext></mrow><mtext>prev</mtext></mfrac><mo fence="true">)</mo></mrow></mrow><annotation encoding="application/x-tex">\text{elapsed} \ge W \times \left(1 - \frac{\text{limit} - \text{cost} - \text{curr}}{\text{prev}}\right)</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">elapsed</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.1389em;">W</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.4em;vertical-align:-0.95em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">(</span></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord">prev</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord">limit</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord text"><span class="mord">cost</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord text"><span class="mord">curr</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.8804em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">)</span></span></span></span></span></span></span>
+<p>curr 本身已達上限時，要等到下一個窗口。實務上也可以保守地回到窗口結束時間。</p>
+<h3 id="4-跟-fixed-window-實作的差異">4. 跟 Fixed Window 實作的差異</h3>
+<p>多一次讀取與一次浮點計算，換來沒有 2 倍邊界問題。記憶體同級，跨 region 也同樣可以非同步加總兩個計數。</p>
+<h2 id="sliding-window-log-實作sorted-set-判定路徑與-retry-after">Sliding Window Log 實作：Sorted Set 判定路徑與 Retry-After</h2>
+<h3 id="1-state-是窗內每筆放行紀錄">1. State 是窗內每筆放行紀錄</h3>
+<p>Redis Sorted Set：score 是 timestamp，member 必須唯一。同一毫秒可能有多筆 request，所以 member 用 timestamp 加 request id 或隨機後綴，不能只用 timestamp。</p>
+<h3 id="2-判定路徑單一-lua-script-1">2. 判定路徑（單一 Lua script）</h3>
+<ol>
+<li><code>ZREMRANGEBYSCORE key 0 (now − 窗口長度)</code> 移除窗外紀錄</li>
+<li><code>ZCARD key</code> 計數</li>
+<li>未超限才 <code>ZADD key now member</code>，並 <code>PEXPIRE key 窗口長度</code></li>
+</ol>
+<p>被拒絕的 request 不寫入，否則持續重試的 client 會一直卡在窗內。在 script 內用 Redis server time，避免 gateway clock skew。</p>
+<h3 id="3-retry-after-2">3. Retry-After</h3>
+<p><code>ZRANGE key 0 0 WITHSCORES</code> 取最舊一筆：<code>Retry-After</code> = 最舊 timestamp + 窗口長度 − now。這是五種演算法中唯一能精確算出何時有額度的。</p>
+<p><strong>延伸</strong>：<a href="/growth-site/03-architecture/global-api-rate-limiter/#sliding-window-log-%E5%AF%A6%E4%BD%9C%E8%A8%98%E6%86%B6%E9%AB%94%E6%88%90%E6%9C%AC%E8%88%87%E8%B7%A8-region-%E9%99%90%E5%88%B6">Sliding Window Log 實作：記憶體成本與跨 region 限制</a>。</p>
+<h2 id="sliding-window-log-實作記憶體成本與跨-region-限制">Sliding Window Log 實作：記憶體成本與跨 region 限制</h2>
+<h3 id="1-成本決定適用範圍">1. 成本決定適用範圍</h3>
+<p>每個 key 最多保存「上限」筆，每筆加上 Sorted Set 的額外開銷約數十到上百 bytes。上限 1,000 次、100 萬個 key 就是數十 GB 級，所以只適合上限小的規則。<code>ZREMRANGEBYSCORE</code> 與 <code>ZADD</code> 是 O(log n)，也比計數型慢。</p>
+<h3 id="2-跨-region">2. 跨 region</h3>
+<p>需要每筆 timestamp 才精確，無法像計數那樣非同步加總。通常只做單區，或對低 QPS、高價值的操作走中央強一致儲存。</p>
+<h2 id="global-rate-limiter事前分配還是事後對帳">Global Rate Limiter：事前分配還是事後對帳</h2>
+<h3 id="1-問題本質">1. 問題本質</h3>
+<p>同一個 tenant 的流量同時進到多個 region，全域上限是 L。要讓各區加總不超過 L，又不能讓每個請求同步跨區。</p>
+<p>Per-region 與 global limit 是不同語意：各 region 使用本地 Redis 延遲最低、故障隔離最好，但同一 client 跨區請求會放大全域額度。先決定可接受多少 over-admission、跨區延遲與單點風險。</p>
+<h3 id="2-四種做法背後是兩個家族">2. 四種做法，背後是兩個家族</h3>
+<table>
+<thead>
+<tr>
+<th>做法</th>
+<th>家族</th>
+<th>機制</th>
+<th>延遲</th>
+<th>誤差</th>
+<th>適合</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>各區獨立</td>
+<td>—</td>
+<td>每區上限 L/N，或各給 L</td>
+<td>最低</td>
+<td>L/N：流量集中在一區時少放；各給 L：最多放到 N 倍</td>
+<td>可容忍誤差的一般 API</td>
+</tr>
+<tr>
+<td>Quota lease</td>
+<td>事前分配</td>
+<td>控制面依近期需求把 L 切給各區，每 Δt 重新平衡</td>
+<td>本區內完成</td>
+<td>總和不超過 L，不會多放；需求轉移時少放</td>
+<td>主流折衷</td>
+</tr>
+<tr>
+<td>非同步對帳</td>
+<td>事後對帳</td>
+<td>各區本地計數，非同步交換用量（類似 G-Counter）</td>
+<td>本區內完成</td>
+<td>多放，上限約為全域速率 × 同步延遲</td>
+<td>計數型演算法、可接受短暫超限</td>
+</tr>
+<tr>
+<td>強一致中央計數器</td>
+<td>—</td>
+<td>每個請求都跨區查詢</td>
+<td>加 50–150ms，且是單點</td>
+<td>精確</td>
+<td>低 QPS、高價值、絕不能超限</td>
+</tr>
+</tbody>
+</table>
+<p><strong>核心論點</strong>：事前分配寧可少放，事後對帳寧可多放。先問這個 endpoint 怕哪一種錯，再選家族。</p>
+<h3 id="3-熱路徑保持本地誤差必須可量化">3. 熱路徑保持本地，誤差必須可量化</h3>
+<p>一般 API 平台採 regional Token Bucket 加中央分配的 quota lease。資料面維持低延遲；控制面管理公平性、quota 補貨與 rule propagation，並讓全域超放量與 lease 使用率可觀測。</p>
+<h3 id="4-演算法與跨區相容性">4. 演算法與跨區相容性</h3>
+<table>
+<thead>
+<tr>
+<th>演算法</th>
+<th>跨區做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Token Bucket</td>
+<td>Quota lease，把補充速率分給各區</td>
+</tr>
+<tr>
+<td>Fixed／Sliding Window Counter</td>
+<td>計數可以直接相加，適合事後對帳</td>
+</tr>
+<tr>
+<td>Sliding Window Log</td>
+<td>需要每筆 timestamp，通常只做單區，或走中央強一致儲存</td>
+</tr>
+</tbody>
+</table>
+<p><strong>延伸</strong>：<a href="/growth-site/03-architecture/global-api-rate-limiter/#global-rate-limiterquota-lease-%E7%9A%84%E5%88%86%E9%85%8D%E5%88%B0%E6%9C%9F%E8%88%87%E6%95%85%E9%9A%9C">Global Rate Limiter：Quota Lease 的分配、到期與故障</a>。</p>
+<blockquote>
+<p>Pre-allocation errs toward rejecting; post-hoc reconciliation errs toward over-admitting. I pick the family by asking which mistake the endpoint can afford.</p>
+</blockquote>
+<h2 id="global-rate-limiterquota-lease-的分配到期與故障">Global Rate Limiter：Quota Lease 的分配、到期與故障</h2>
+<h3 id="1-怎麼分">1. 怎麼分</h3>
+<p>控制面依前一週期各區實際用量的比例分配全域上限 L，另外保留約 10% 當全域備用池，突發的區可以申請。</p>
+<ul>
+<li>
+<p>例：L = 10k/min，三區用量 60%／30%／10%。先保留 1k，其餘 9k 分成 5.4k／2.7k／0.9k。</p>
+</li>
+<li>
+<p>每 Δt（例如 10 秒）依最新用量重新平衡。</p>
+</li>
+</ul>
+<h3 id="2-lease-一定要有到期時間">2. Lease 一定要有到期時間</h3>
+<p>某一區網路斷開時，lease 到期就自動失效，那一區不能無限期用舊額度；其他區在下次平衡時接手這份額度。沒有到期時間，斷線的區持續放行，加上其他區新拿到的額度，總和就超過 L。</p>
+<h3 id="3-故障時的退路">3. 故障時的退路</h3>
+<ul>
+<li>
+<p><strong>控制面掛掉</strong>：各區沿用現有 lease 到期，之後退回保守的靜態值，例如 L/N × 0.8。</p>
+</li>
+<li>
+<p><strong>Region 掛掉</strong>：GLB 把流量導到其他區；那些區需求上升，下次平衡時拿到更多額度。</p>
+</li>
+<li>
+<p><strong>流量整批轉移</strong>：例如全部移到亞洲區。重新平衡前的過渡期，亞洲區額度不足而少放；備用池與縮短 Δt 可以降低影響。</p>
+</li>
+</ul>
+<h3 id="4-觀測">4. 觀測</h3>
+<p>全域超放量（全域實際放行 − L）、各區 lease 使用率、平衡延遲、備用池水位。</p>
+<blockquote>
+<p>Each region enforces a lease from the control plane locally; leases expire so a partitioned region cannot keep spending quota, and when the control plane is down regions fall back to a conservative static share.</p>
+</blockquote>
+<h2 id="一個請求的完整判定路徑">一個請求的完整判定路徑</h2>
+<ol>
+<li>
+<p>Gateway 用本地規則快取，比對出這個請求命中的維度。</p>
+</li>
+<li>
+<p><strong>共用維度</strong>（region、domain）：用本地計數或 lease 判斷，不夠就拒絕，不碰 Redis。</p>
+</li>
+<li>
+<p><strong>身分維度</strong>（商戶、商戶 × API）：本區 Redis 的一個 Lua script（同一個 slot），全部通過才扣；大商戶改用預取的 token 在本地扣。</p>
+</li>
+<li>
+<p>放行後非同步回報用量給 Usage Aggregator；拒絕時回 <code>429</code> 加 <code>Retry-After</code>。</p>
+</li>
+<li>
+<p>控制面每 Δt 彙整各區用量、重新分配 lease，推送給各區。</p>
+</li>
+<li>
+<p>觀測全域超放量、lease 使用率、平衡延遲與熱點 key 的 QPS。</p>
+</li>
+</ol>
+<p>先查便宜的本地維度，攻擊流量在碰到 Redis 之前就能被擋下，對應 <a href="/growth-site/03-architecture/global-api-rate-limiter/#limiter-%E5%AE%B9%E9%87%8F%E8%A6%81%E4%BE%9D%E6%94%BB%E6%93%8A%E6%B5%81%E9%87%8F%E8%A8%AD%E8%A8%88">Limiter 容量要依攻擊流量設計</a>。Redis 或控制面失敗時的處理見 <a href="/growth-site/03-architecture/global-api-rate-limiter/#failure-handlingobservability-%E8%88%87%E9%9D%A2%E8%A9%A6%E8%BF%BD%E5%95%8F">Failure Handling、Observability 與面試追問</a>。</p>
+<h2 id="failure-handlingobservability-與面試追問">Failure Handling、Observability 與面試追問</h2>
+<h3 id="1-failure-policy-依-endpoint-風險選擇">1. Failure policy 依 endpoint 風險選擇</h3>
+<p>Redis、config service 或 quota control plane 失敗時，高風險、付費或易 abuse endpoint 採 fail closed；低風險讀取可短暫 fail open；也可退回保守的 local static limit。偵測方式是 Redis 呼叫設 5–10ms timeout 加 circuit breaker：滑動時間窗內錯誤率超過門檻就切到本地 1/N 額度，進入 half-open 後放少量請求探測 Redis 是否恢復。</p>
+<h3 id="2-client-contract-必須避免-retry-storm">2. Client contract 必須避免 retry storm</h3>
+<p>超限回 <code>429</code>，附 <code>Retry-After</code>、remaining quota、limit 與 reset time，讓 client 使用 backoff 加 jitter，而非同步重試。</p>
+<h3 id="3-觀測同時證明保護與公平">3. 觀測同時證明保護與公平</h3>
+<p>量測 allow／reject rate、decision latency、error rate、bucket remaining、quota lease、over-admission、config propagation、top rejected clients 與熱點 endpoint。每個 global 誤差都要可量化與可觀測。</p>
+<h2 id="limiter-容量要依攻擊流量設計">Limiter 容量要依攻擊流量設計</h2>
+<p>請求要先判定才能拒絕，每個被拒絕的 request 同樣消耗查詢與網路成本。</p>
+<ul>
+<li>例：正常尖峰 2k QPS、攻擊 50k QPS 時，只依 2k 設計會先打垮 limiter 本身。</li>
+<li>所以 limiter 不能是唯一一層；大部分攻擊流量要在更前面、更便宜的層先被擋下，見 <a href="/growth-site/03-architecture/global-api-rate-limiter/#%E5%88%86%E5%B1%A4%E9%98%B2%E7%A6%A6%E6%94%BB%E6%93%8A%E6%B5%81%E9%87%8F%E5%9C%A8%E5%93%AA%E4%B8%80%E5%B1%A4%E8%A2%AB%E6%93%8B%E4%B8%8B">分層防禦，攻擊流量在哪一層被擋下？</a>。</li>
+</ul>
+<blockquote>
+<p>Every request must be checked before it can be rejected, so the limiter must be sized for attack traffic, not normal peak.</p>
+</blockquote>
+<h2 id="分層防禦攻擊流量在哪一層被擋下">分層防禦，攻擊流量在哪一層被擋下？</h2>
+<p>越前面越便宜、越粗；越後面越精準、越貴。</p>
+<table>
+<thead>
+<tr>
+<th>層</th>
+<th>看得到什麼</th>
+<th>典型規則</th>
+<th>角色</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Edge／WAF（CDN 節點，origin 之前）</td>
+<td>IP、header、路徑、地理位置、bot 指紋</td>
+<td>IP 信譽與黑名單、per-IP rate rule、geo block、JS challenge／CAPTCHA</td>
+<td>吸收大部分攻擊流量；容量由供應商擴展，不消耗自家頻寬與 LB</td>
+</tr>
+<tr>
+<td>Load balancer</td>
+<td>連線</td>
+<td>只負責分流</td>
+<td>不是限流層</td>
+</tr>
+<tr>
+<td>API gateway</td>
+<td>device、token、IP 網段</td>
+<td>per-device、per-subnet Token Bucket</td>
+<td>削掉 edge 漏下的分散流量</td>
+</tr>
+<tr>
+<td>業務服務 + Redis</td>
+<td>帳號、手機號、業務狀態</td>
+<td>per-phone、per-account、驗證次數</td>
+<td>精準規則，只處理已被削減的流量</td>
+</tr>
+<tr>
+<td>昂貴下游之前</td>
+<td>總量</td>
+<td>全域預算 + circuit breaker</td>
+<td>成本保險，不是第一道防線</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>Cheap, coarse checks at the edge absorb most of the attack; precise per-identity checks run deeper, on traffic that has already been reduced.</p>
+</blockquote>
+<h2 id="分層是分工global-cap-放在昂貴下游之前">分層是分工，global cap 放在昂貴下游之前</h2>
+<h3 id="1-edgewaf-看不到業務身分">1. Edge／WAF 看不到業務身分</h3>
+<p>它不知道手機號或帳號，所以「每個手機號 60 秒 1 次」仍要放在業務服務。分層是分工，不是重複檢查。</p>
+<h3 id="2-global-cap-的位置決定對錯">2. Global cap 的位置決定對錯</h3>
+<p>單一 global cap 放在最前面當主要防線，攻擊流量吃光額度後，合法請求跟著被拒，等於替攻擊者完成 DoS。放在昂貴下游之前當成本上限才是正確用法。</p>
+<h2 id="edgewafwaf-檢查內容rate-rule-檢查頻率">Edge／WAF：WAF 檢查內容，rate rule 檢查頻率</h2>
+<p>WAF（Web Application Firewall）是 origin 前的 L7 reverse proxy，依規則比對 method、path、header、query、body、IP 信譽、地理位置與 bot 訊號，動作有 allow、block、challenge（JS challenge／CAPTCHA）與 count（只記錄）。Rate limiting 只是其中一類規則。</p>
+<p><strong>延伸</strong>：<a href="/growth-site/03-architecture/global-api-rate-limiter/#edgewaf%E4%BE%9D%E6%94%BB%E6%93%8A%E9%A1%9E%E5%9E%8B%E5%B0%8D%E6%87%89%E9%98%B2%E7%A6%A6%E6%89%8B%E6%AE%B5">Edge／WAF：依攻擊類型對應防禦手段</a>、<a href="/growth-site/03-architecture/global-api-rate-limiter/#edgewaf%E6%96%B0%E8%A6%8F%E5%89%87%E5%85%88-count-%E5%86%8D-block">Edge／WAF：新規則先 count 再 block</a>、<a href="/growth-site/03-architecture/global-api-rate-limiter/#edgewaforigin-%E5%8F%AA%E6%8E%A5%E5%8F%97-edge-%E6%B5%81%E9%87%8F%E8%A6%8F%E5%89%87%E8%AE%8A%E6%9B%B4%E4%B9%9F%E8%A6%81%E7%81%B0%E5%BA%A6">Edge／WAF：Origin 只接受 edge 流量，規則變更也要灰度</a>。</p>
+<blockquote>
+<p>A WAF inspects what a request contains; rate limiting controls how often requests arrive. I put managed rules, bot challenges and per-IP rate rules at the edge, lock the origin to edge traffic only, and roll out new rules in count mode before blocking — the WAF reduces load and known attacks, but parameterized queries and per-identity limits still live in the application.</p>
+</blockquote>
+<h2 id="edgewaf依攻擊類型對應防禦手段">Edge／WAF：依攻擊類型對應防禦手段</h2>
+<table>
+<thead>
+<tr>
+<th>攻擊</th>
+<th>WAF 手段</th>
+<th>限制與後端仍要做的事</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>注入類：SQL injection、XSS、path traversal、command injection</td>
+<td>Managed rule set（例如 OWASP Core Rule Set）比對 signature，並以 anomaly score 累計多條規則命中</td>
+<td>只認得已知 pattern，編碼繞過仍可能漏；後端仍要 parameterized query、input validation 與 output encoding</td>
+</tr>
+<tr>
+<td>已知漏洞利用，例如 Log4Shell</td>
+<td>供應商發布 virtual patch 規則，先擋 exploit payload</td>
+<td>爭取修補時間，不取代升級套件</td>
+</tr>
+<tr>
+<td>Bot：credential stuffing、scraping、OTP 轟炸</td>
+<td>Bot score、TLS 指紋（JA3／JA4）、IP 信譽、JS challenge／CAPTCHA</td>
+<td>進階 bot 使用住宅 proxy 與真實瀏覽器；per-account、per-phone 規則仍在業務層，見 <a href="/growth-site/03-architecture/global-api-rate-limiter/#login-%E8%88%87-otp-%E7%9A%84%E5%85%B8%E5%9E%8B%E9%99%90%E6%B5%81%E8%A6%8F%E5%89%87">Login 與 OTP 的典型限流規則</a></td>
+</tr>
+<tr>
+<td>L7 DDoS：HTTP flood</td>
+<td>Per-IP／per-path rate rule、流量異常自動偵測、對可疑來源發 challenge</td>
+<td>大量 IP 低速分散攻擊時，每個 IP 都不超限，要靠 gateway 的 per-device、per-subnet 規則</td>
+</tr>
+<tr>
+<td>L3／L4 volumetric：SYN flood、UDP amplification</td>
+<td>不屬於 WAF 規則；由 CDN／scrubbing network 的 anycast 容量吸收</td>
+<td>同一供應商常一起提供，但要確認合約涵蓋範圍</td>
+</tr>
+</tbody>
+</table>
+<h2 id="edgewaf新規則先-count-再-block">Edge／WAF：新規則先 count 再 block</h2>
+<p>新規則先以 count／log 模式觀察 false positive，確認後才切 block。對誤判集中的 path（例如檔案上傳、富文本 API）設範圍明確的例外，不要整條規則關掉。</p>
+<p>觀測 per-rule hit、block rate、challenge 通過率，以及被擋請求中的已登入用戶比例。</p>
+<h2 id="edgewaforigin-只接受-edge-流量規則變更也要灰度">Edge／WAF：Origin 只接受 edge 流量，規則變更也要灰度</h2>
+<h3 id="1-origin-必須只接受-edge-流量">1. Origin 必須只接受 edge 流量</h3>
+<p>攻擊者一旦找到 origin IP 就能繞過 WAF。Origin 防火牆只放行 CDN 的 IP 段，或以 mTLS、edge 注入的 secret header 驗證來源。</p>
+<h3 id="2-waf-規則本身也會造成事故">2. WAF 規則本身也會造成事故</h3>
+<p>WAF 在每個 request 的路徑上。2019 年 Cloudflare 一條 WAF regex 規則造成 backtracking，全球節點 CPU 耗盡。Regex 規則要測試最壞情況效能，並分批上線。</p>
+<h2 id="login-與-otp-先建立威脅模型">Login 與 OTP 先建立威脅模型</h2>
+<p>Public API 限流以公平與延遲為先；login 與 OTP 限流主要防濫用與成本。</p>
+<ul>
+<li>例如每封簡訊約 NT$1，攻擊 50k QPS 持續一分鐘就是 300 萬封、約 NT$300 萬，還可能讓簡訊商限速，真實用戶收不到 OTP。</li>
+<li>6 位數 OTP 只有 100 萬種組合，可被暴力猜中。</li>
+</ul>
+<p>因此優先序是：防濫用與正確性 → 攻擊期間合法用戶仍可使用 → 延遲。</p>
+<blockquote>
+<p>For login and OTP, the main threat is abuse and cost, not fairness. I rank abuse prevention first, availability for real users during an attack second, and latency third — and I fail closed when the limiter is unavailable.</p>
+</blockquote>
+<h2 id="login-與-otp-的典型限流規則">Login 與 OTP 的典型限流規則</h2>
+<p>規則依身分精準限制，前提是先建立威脅模型：<a href="/growth-site/03-architecture/global-api-rate-limiter/#login-%E8%88%87-otp-%E5%85%88%E5%BB%BA%E7%AB%8B%E5%A8%81%E8%84%85%E6%A8%A1%E5%9E%8B">Login 與 OTP 先建立威脅模型</a>。以下是示意，依產品調整：</p>
+<ul>
+<li>OTP 發送：per phone 每 60 秒 1 次、每小時 5 次；另設 per IP、per device 上限。</li>
+<li>OTP 驗證：每個 code 最多試 5 次，超過即作廢。</li>
+<li>登入失敗：per account 15 分鐘 5 次後要求 CAPTCHA 或 step-up 驗證；不直接鎖帳號，否則攻擊者可以故意鎖住受害者。</li>
+</ul>
+<p><strong>延伸</strong>：<a href="/growth-site/03-architecture/global-api-rate-limiter/#login-%E8%88%87-otp-%E7%9A%84-key-%E6%95%B8%E9%87%8F%E8%88%87%E6%95%85%E9%9A%9C%E5%9B%9E%E6%87%89">Login 與 OTP 的 key 數量與故障回應</a>。</p>
+<h2 id="login-與-otp-的-key-數量與故障回應">Login 與 OTP 的 key 數量與故障回應</h2>
+<h3 id="1-key-數量由攻擊者決定不由-dau-決定">1. Key 數量由攻擊者決定，不由 DAU 決定</h3>
+<p>隨機手機號會讓每個請求建立新 key，50k/s 持續一小時約 1.8 億個。用 TTL ≈ capacity ÷ refillRate 回收、在建立手機號 key 之前先以 IP／device 限流，並驗證號碼格式，控制記憶體。</p>
+<h3 id="2-超限與-limiter-故障是兩件事">2. 超限與 limiter 故障是兩件事</h3>
+<p>超限回 <code>429</code>；limiter 自身逾時或不可用屬於 failure，OTP 發送採 fail closed，回 <code>503</code> 加 <code>Retry-After</code>。</p></article></main></body></html>
